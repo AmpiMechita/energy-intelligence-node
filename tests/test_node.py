@@ -115,3 +115,28 @@ def test_api_report_endpoint(tmp_path, monkeypatch):
     assert rep["title"] == "perovskite-solar"
     assert rep["aggregate"]["count"] == 1
     assert "Informe de Due-Diligence" in rep["markdown"]
+
+
+def test_extract_efficiency_word_before_value():
+    m = ein.extract_all_metrics("The cell reached an efficiency of 25.3% under AM1.5")
+    assert any(x["metric_name"] == "efficiency" and x["metric_value"] == 25.3 for x in m)
+
+def test_extract_pce_phrasing():
+    m = ein.extract_all_metrics("power conversion efficiency reached 24.1 %")
+    assert any(x["metric_name"] == "efficiency" and x["metric_value"] == 24.1 for x in m)
+
+def test_extract_energy_density_word_before():
+    m = ein.extract_all_metrics("an energy density of 500 Wh/kg was achieved")
+    assert any(x["metric_name"] == "energy_density" and x["metric_value"] == 500.0 for x in m)
+
+def test_extract_energy_density_spaced_unit():
+    m = ein.extract_all_metrics("delivering 480 Wh kg at cell level")
+    assert any(x["metric_name"] == "energy_density" and x["metric_value"] == 480.0 for x in m)
+
+def test_extract_cost_dollar_prefix():
+    m = ein.extract_all_metrics("a projected cost of $80/kWh")
+    assert any(x["metric_name"] == "cost" and x["metric_value"] == 80.0 for x in m)
+
+def test_arxiv_queries_are_focused():
+    assert any("perovskite" in q for q in ein.ARXIV_QUERIES)
+    assert any("battery" in q for q in ein.ARXIV_QUERIES)

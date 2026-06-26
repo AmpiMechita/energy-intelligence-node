@@ -147,15 +147,16 @@ TECH_KEYWORDS = {
 }
 
 METRIC_PATTERNS = [
-    (r"(\d+(?:\.\d+)?)\s*Wh/kg",              "energy_density",    "Wh/kg",  1),
-    (r"(\d+(?:\.\d+)?)\s*Wh/L",               "volumetric_density","Wh/L",   1),
-    (r"(\d+(?:\.\d+)?)\s*%\s*(?:efficiency|PCE|power conversion)",
-                                                "efficiency",      "%",      1),
-    (r"(\d+(?:\.\d+)?)\s*mW/cm[2]",           "power_density",     "mW/cm2", 1),
-    (r"(\d+(?:\.\d+)?)\s*kW/kg",              "specific_power",    "kW/kg",  1),
-    (r"(\d+(?:\.\d+)?)\s*\$/kWh",             "cost",              "$/kWh",  1),
-    (r"(\d+(?:\.\d+)?)\s*hours?.*cycling",    "cycle_life",        "hours",  1),
-    (r"(\d+(?:\.\d+)?)\s*cycles",             "cycle_life",        "cycles", 1),
+    (r"(\d+(?:\.\d+)?)\s*Wh\s*[/ ]\s*kg", "energy_density", "Wh/kg", 1),
+    (r"energy\s+densit(?:y|ies)\s*(?:of|reaching|reached|up\s*to|~|=|:|is|was)?\s*(\d+(?:\.\d+)?)\s*Wh", "energy_density", "Wh/kg", 1),
+    (r"(\d+(?:\.\d+)?)\s*Wh\s*[/ ]\s*L", "volumetric_density", "Wh/L", 1),
+    (r"(\d+(?:\.\d+)?)\s*%\s*(?:power[\s-]*conversion\s*)?(?:efficiency|PCE)", "efficiency", "%", 1),
+    (r"(?:power[\s-]*conversion\s*efficiency|efficiency|PCE)\s*(?:of|reached|reaching|exceeding|up\s*to|~|=|:|is|was)?\s*(\d+(?:\.\d+)?)\s*%", "efficiency", "%", 1),
+    (r"(\d+(?:\.\d+)?)\s*mW\s*[/ ]\s*cm", "power_density", "mW/cm2", 1),
+    (r"(\d+(?:\.\d+)?)\s*kW\s*[/ ]\s*kg", "specific_power", "kW/kg", 1),
+    (r"\$\s*(\d+(?:\.\d+)?)\s*/?\s*kWh", "cost", "$/kWh", 1),
+    (r"(\d+(?:\.\d+)?)\s*\$\s*/?\s*kWh", "cost", "$/kWh", 1),
+    (r"(\d+(?:\.\d+)?)\s*cycles", "cycle_life", "cycles", 1),
 ]
 
 def classify_technology(text: str) -> str:
@@ -210,11 +211,12 @@ def annotate_claim(claim: dict) -> dict:
 # ──────────────────── SCRAPERS ───────────────────────────────────
 
 def scrape_arxiv(query: str = "all:renewable energy AND cat:physics*",
-                 max_results: int = MAX_RESULTS) -> list[dict]:
+                 max_results: int = MAX_RESULTS,
+                 sort_by: str = "submittedDate") -> list[dict]:
     """ArXiv API (Atom XML) -> lista de claims normalizados."""
     claims = []
     params = {"search_query": query, "start": 0, "max_results": max_results,
-              "sortBy": "submittedDate", "sortOrder": "descending"}
+              "sortBy": sort_by, "sortOrder": "descending"}
     try:
         r = requests.get(ARXIV_API, params=params, timeout=30)
         r.raise_for_status()
@@ -251,6 +253,30 @@ def scrape_arxiv(query: str = "all:renewable energy AND cat:physics*",
         })
     print(f"[ArXiv] {len(claims)} papers")
     return claims
+
+ARXIV_QUERIES = [
+    "all:perovskite solar cell efficiency",
+    "all:solid-state battery energy density",
+    "all:sodium-ion battery",
+    "all:green hydrogen electrolysis efficiency",
+    "all:redox flow battery",
+    "all:thermophotovoltaic efficiency",
+    "all:silicon solar cell efficiency",
+]
+
+def scrape_arxiv_topics(queries: list = None, per_query: int = 8) -> list:
+    queries = queries or ARXIV_QUERIES
+    out = []
+    seen = set()
+    for q in queries:
+        for c in scrape_arxiv(q, max_results=per_query, sort_by="relevance"):
+            if c["source_url"] in seen:
+                continue
+            seen.add(c["source_url"])
+            out.append(c)
+        time.sleep(SCRAPE_DELAY)
+    print(f"[ArXiv] total enfocado: {len(out)} papers")
+    return out
 
 def scrape_uspto(terms: list[str] = None, max_results: int = MAX_RESULTS) -> list[dict]:
     """USPTO PatentsView Search API -> claims de patentes.
@@ -369,7 +395,7 @@ def run_ingest():
     new = 0
     flagged = 0
     with db_conn() as conn:
-        for scraper in [scrape_arxiv, scrape_uspto, scrape_climate_pr]:
+        for scraper in [scrape_arxiv_topics, scrape_uspto, scrape_climate_pr]:
             for claim in scraper():
                 annotate_claim(claim)
                 if claim.get("status", "claimed") != "claimed":
