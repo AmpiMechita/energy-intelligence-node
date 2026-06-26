@@ -1,39 +1,17 @@
 #!/usr/bin/env python3
 """
-Energy Intelligence Node  ─  Single-file data ingestion + REST API
-===================================================================
-Rastrea claims físicos de tecnologías de energía renovable de nueva generación.
-
-Fuentes:  ArXiv (papers) · USPTO PatentsView (patentes) · Climate Tech PR
-Storage:  SQLite
-API:      FastAPI
+Energy Intelligence Node - Single-file data ingestion + REST API
+Rastrea claims fisicos de tecnologias de energia renovable.
+Fuentes: ArXiv (papers) - USPTO PatentsView (patentes) - Climate Tech PR
+Storage: SQLite | API: FastAPI
 
 Uso:
     pip install fastapi uvicorn requests beautifulsoup4 lxml
-    python energy_intel_node.py              # crea DB + lanza API en :8000
-    python energy_intel_node.py --scrape     # modo CLI: solo ingesta, sin API
-
-Arquitectura (todo en este archivo, < 500 líneas):
-    ┌─────────────┐   ┌──────────────┐   ┌──────────────────┐
-    │  ArXiv API  │   │ USPTO PV API │   │  Climate Tech PR │
-    └──────┬──────┘   └──────┬───────┘   └────────┬─────────┘
-           │                 │                     │
-           └──────────┬──────┴─────────────────────┘
-                      ▼
-              ┌───────────────┐
-              │  IngestPipeline│  ← dedup + normaliza
-              └───────┬───────┘
-                      ▼
-              ┌───────────────┐
-              │   SQLite DB   │  tabla: claims
-              └───────┬───────┘
-                      ▼
-              ┌───────────────┐
-              │   FastAPI      │  GET/POST /claims, /stats, /scrape
-              └───────────────┘
+    python energy_intel_node.py            # crea DB + lanza API en :8000
+    python energy_intel_node.py --scrape   # modo CLI: solo ingesta, sin API
 """
 
-import argparse, hashlib, json, re, sqlite3, time
+import argparse, hashlib, json, os, re, sqlite3, time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Optional
@@ -41,11 +19,29 @@ from typing import Optional
 import requests
 from bs4 import BeautifulSoup
 
+try:
+    from contradiction_engine import evaluate_claim
+except ImportError:  # pragma: no cover
+    from .contradiction_engine import evaluate_claim
+
+try:
+    from credibility import score_claim, score_group
+    from report import generate_report
+except ImportError:  # pragma: no cover
+    from .credibility import score_claim, score_group
+    from .report import generate_report
+
 # ──────────────────────────── CONFIG ─────────────────────────────
 
 DB_PATH       = "energy_intel.db"
 ARXIV_API     = "https://export.arxiv.org/api/query"
-USPTO_PV_API  = "https://api.patentsview.org/patents/query"
+# PatentsView migro su API legacy a la nueva Search API, que requiere una API
+# key gratuita (header X-Api-Key). Se obtiene en:
+#   https://patentsview.org/apis/keyrequest
+# Se lee desde la variable de entorno PATENTSVIEW_API_KEY (opcional: si falta,
+# el scraper de patentes se omite con un aviso, sin romper la ingesta).
+USPTO_PV_API  = "https://search.patentsview.org/api/v1/patent/"
+PATENTSVIEW_API_KEY = os.environ.get("PATENTSVIEW_API_KEY", "")
 CLIMATE_FEEDS = [
     "https://cleantechnica.com/feed/",
     "https://renewablesnow.com/feed/",
@@ -57,18 +53,21 @@ MAX_RESULTS   = 25    # por fuente por corrida
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS claims (
-    id            TEXT PRIMARY KEY,          -- hash(source_url + title + date)
-    source_type   TEXT NOT NULL,             -- paper | patent | press_release
+    id            TEXT PRIMARY KEY,
+    source_type   TEXT NOT NULL,
     source_url    TEXT NOT NULL,
     title         TEXT NOT NULL,
     authors       TEXT DEFAULT '',
-    date_pub      TEXT NOT NULL,             -- ISO-8601
-    technology    TEXT NOT NULL,             -- ej: solid-state-battery, perovskite-solar
-    metric_name   TEXT DEFAULT '',           -- ej: energy_density, efficiency
+    date_pub      TEXT NOT NULL,
+    technology    TEXT NOT NULL,
+    metric_name   TEXT DEFAULT '',
     metric_value  REAL,
-    metric_unit   TEXT DEFAULT '',           -- ej: Wh/kg, %
+    metric_unit   TEXT DEFAULT '',
     claim_text    TEXT NOT NULL,
-    status        TEXT NOT NULL DEFAULT 'claimed',  -- claimed | disputed | debunked
+    status        TEXT NOT NULL DEFAULT 'claimed',
+    flag_reason   TEXT DEFAULT '',
+    flag_law      TEXT DEFAULT '',
+    checked_metrics TEXT DEFAULT '[]',
     raw_json      TEXT DEFAULT '{}',
     created_at    TEXT NOT NULL,
     updated_at    TEXT NOT NULL
@@ -77,6 +76,13 @@ CREATE INDEX IF NOT EXISTS idx_tech   ON claims(technology);
 CREATE INDEX IF NOT EXISTS idx_status ON claims(status);
 CREATE INDEX IF NOT EXISTS idx_date   ON claims(date_pub);
 """
+
+# Columnas anadidas en versiones posteriores -> migracion no destructiva.
+_MIGRATION_COLUMNS = {
+    "flag_reason": "TEXT DEFAULT ''",
+    "flag_law": "TEXT DEFAULT ''",
+    "checked_metrics": "TEXT DEFAULT '[]'",
+}
 
 @contextmanager
 def db_conn():
@@ -92,6 +98,14 @@ def db_conn():
 def init_db():
     with db_conn() as c:
         c.executescript(SCHEMA)
+        _ensure_columns(c)
+
+def _ensure_columns(conn):
+    """Anade columnas nuevas a DBs creadas con versiones anteriores."""
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(claims)")}
+    for col, decl in _MIGRATION_COLUMNS.items():
+        if col not in existing:
+            conn.execute(f"ALTER TABLE claims ADD COLUMN {col} {decl}")
 
 def claim_id(url: str, title: str, date: str) -> str:
     raw = f"{url}|{title}|{date}"
@@ -107,14 +121,15 @@ def upsert_claim(conn, claim: dict) -> bool:
     conn.execute("""
         INSERT INTO claims (id,source_type,source_url,title,authors,date_pub,
             technology,metric_name,metric_value,metric_unit,claim_text,
-            status,raw_json,created_at,updated_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            status,flag_reason,flag_law,checked_metrics,raw_json,created_at,updated_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     """, (cid, claim["source_type"], claim["source_url"], claim["title"],
           claim.get("authors",""), claim["date_pub"], claim["technology"],
           claim.get("metric_name",""), claim.get("metric_value"),
           claim.get("metric_unit",""), claim["claim_text"],
-          claim.get("status","claimed"), json.dumps(claim.get("raw",{})),
-          now, now))
+          claim.get("status","claimed"), claim.get("flag_reason",""),
+          claim.get("flag_law",""), json.dumps(claim.get("checked_metrics", [])),
+          json.dumps(claim.get("raw",{})), now, now))
     return True
 
 # ──────────────────── EXTRACTION HELPERS ─────────────────────────
@@ -128,19 +143,19 @@ TECH_KEYWORDS = {
     "thermophotovoltaic":   r"thermophotovoltaic|tpv|thermo.?pv",
     "fusion":               r"fusion.?energy|inertial.?confinement|magnetic.?fusion",
     "agrivoltaics":         r"agrivoltaic|dual.?use.?solar|crop.?solar",
+    "wind":                 r"wind.?turbine|wind.?energy|wind.?power|offshore.?wind|onshore.?wind",
 }
 
 METRIC_PATTERNS = [
-    # (regex, metric_name, unit, value_group_idx)
-    (r"(\d+(?:\.\d+)?)\s*Wh/kg",              "energy_density",  "Wh/kg", 1),
-    (r"(\d+(?:\.\d+)?)\s*Wh/L",               "volumetric_density","Wh/L",1),
+    (r"(\d+(?:\.\d+)?)\s*Wh/kg",              "energy_density",    "Wh/kg",  1),
+    (r"(\d+(?:\.\d+)?)\s*Wh/L",               "volumetric_density","Wh/L",   1),
     (r"(\d+(?:\.\d+)?)\s*%\s*(?:efficiency|PCE|power conversion)",
                                                 "efficiency",      "%",      1),
-    (r"(\d+(?:\.\d+)?)\s*mW/cm[²2]",          "power_density",   "mW/cm²", 1),
-    (r"(\d+(?:\.\d+)?)\s*kW/kg",              "specific_power",  "kW/kg",  1),
-    (r"(\d+(?:\.\d+)?)\s*\$/kWh",             "cost",            "$/kWh",  1),
-    (r"(\d+(?:\.\d+)?)\s*hours?.*cycling",     "cycle_life",      "hours",  1),
-    (r"(\d+(?:\.\d+)?)\s*cycles",             "cycle_life",      "cycles", 1),
+    (r"(\d+(?:\.\d+)?)\s*mW/cm[2]",           "power_density",     "mW/cm2", 1),
+    (r"(\d+(?:\.\d+)?)\s*kW/kg",              "specific_power",    "kW/kg",  1),
+    (r"(\d+(?:\.\d+)?)\s*\$/kWh",             "cost",              "$/kWh",  1),
+    (r"(\d+(?:\.\d+)?)\s*hours?.*cycling",    "cycle_life",        "hours",  1),
+    (r"(\d+(?:\.\d+)?)\s*cycles",             "cycle_life",        "cycles", 1),
 ]
 
 def classify_technology(text: str) -> str:
@@ -151,19 +166,52 @@ def classify_technology(text: str) -> str:
     return "other"
 
 def extract_metrics(text: str) -> dict:
-    """Extrae la primera métrica reconocida del texto."""
+    """Extrae la PRIMERA metrica reconocida (compatibilidad hacia atras)."""
+    all_m = extract_all_metrics(text)
+    return all_m[0] if all_m else {}
+
+def extract_all_metrics(text: str) -> list[dict]:
+    """Extrae TODAS las metricas reconocidas del texto, sin duplicar."""
+    found: list[dict] = []
+    seen: set = set()
     for pat, name, unit, gidx in METRIC_PATTERNS:
-        m = re.search(pat, text, re.IGNORECASE)
-        if m:
-            return {"metric_name": name, "metric_value": float(m.group(gidx)),
-                    "metric_unit": unit}
-    return {}
+        for m in re.finditer(pat, text, re.IGNORECASE):
+            try:
+                value = float(m.group(gidx))
+            except (ValueError, IndexError):
+                continue
+            key = (name, value, unit)
+            if key in seen:
+                continue
+            seen.add(key)
+            found.append({"metric_name": name, "metric_value": value,
+                          "metric_unit": unit})
+    return found
+
+def annotate_claim(claim: dict) -> dict:
+    """Corre el motor de contradiccion sobre un claim y le anade el veredicto.
+
+    No sobreescribe un status fijado manualmente a 'disputed' o 'debunked'
+    por un humano; solo decide cuando viene 'claimed'.
+    """
+    text = f"{claim.get('title','')} {claim.get('claim_text','')}"
+    metrics = extract_all_metrics(text)
+    claim["checked_metrics"] = metrics
+    if claim.get("status", "claimed") != "claimed":
+        claim.setdefault("flag_reason", "")
+        claim.setdefault("flag_law", "")
+        return claim
+    verdict = evaluate_claim(claim.get("technology", "other"), metrics)
+    claim["status"] = verdict["status"]
+    claim["flag_reason"] = verdict["flag_reason"]
+    claim["flag_law"] = verdict["flag_law"]
+    return claim
 
 # ──────────────────── SCRAPERS ───────────────────────────────────
 
 def scrape_arxiv(query: str = "all:renewable energy AND cat:physics*",
                  max_results: int = MAX_RESULTS) -> list[dict]:
-    """ArXiv API (Atom XML) → lista de claims normalizados."""
+    """ArXiv API (Atom XML) -> lista de claims normalizados."""
     claims = []
     params = {"search_query": query, "start": 0, "max_results": max_results,
               "sortBy": "submittedDate", "sortOrder": "descending"}
@@ -182,8 +230,8 @@ def scrape_arxiv(query: str = "all:renewable energy AND cat:physics*",
         pub_t   = entry.find("published")
         if not title_t or not id_t:
             continue
-        title = title_t.get_text(strip=True).replace("\n"," ")
-        abstract = summ_t.get_text(strip=True).replace("\n"," ") if summ_t else ""
+        title = title_t.get_text(strip=True).replace(chr(10), " ")
+        abstract = summ_t.get_text(strip=True).replace(chr(10), " ") if summ_t else ""
         url = id_t.get_text(strip=True)
         published = pub_t.get_text(strip=True)[:10] if pub_t else ""
         author_names = entry.find_all("name")
@@ -205,24 +253,34 @@ def scrape_arxiv(query: str = "all:renewable energy AND cat:physics*",
     return claims
 
 def scrape_uspto(terms: list[str] = None, max_results: int = MAX_RESULTS) -> list[dict]:
-    """USPTO PatentsView API → claims de patentes."""
+    """USPTO PatentsView Search API -> claims de patentes.
+
+    Si no hay API key configurada, se omite limpiamente sin romper la ingesta.
+    """
+    if not PATENTSVIEW_API_KEY:
+        print("[USPTO] Omitido: falta PATENTSVIEW_API_KEY "
+              "(gratis en https://patentsview.org/apis/keyrequest)")
+        return []
     if terms is None:
         terms = ["solid state battery", "perovskite solar cell",
                  "sodium ion battery", "green hydrogen electrolysis"]
     claims = []
+    headers = {"X-Api-Key": PATENTSVIEW_API_KEY, "Accept": "application/json"}
     for term in terms:
-        body = {
-            "q": {"_and": [
-                {"_text_any": {"patent_title": term}},
-                {"_gte": {"patent_date": "2023-01-01"}}
-            ]},
-            "f": ["patent_number","patent_title","patent_date",
-                  "inventor_first_name","inventor_last_name","patent_abstract"],
-            "s": [{"patent_date":"desc"}],
-            "o": {"per_page": min(max_results, 25)}
+        query = {"_and": [
+            {"_text_any": {"patent_title": term}},
+            {"_gte": {"patent_date": "2023-01-01"}},
+        ]}
+        fields = ["patent_id", "patent_title", "patent_date", "patent_abstract",
+                  "inventors.inventor_name_first", "inventors.inventor_name_last"]
+        params = {
+            "q": json.dumps(query),
+            "f": json.dumps(fields),
+            "s": json.dumps([{"patent_date": "desc"}]),
+            "o": json.dumps({"size": min(max_results, 25)}),
         }
         try:
-            r = requests.post(USPTO_PV_API, json=body, timeout=30)
+            r = requests.get(USPTO_PV_API, params=params, headers=headers, timeout=30)
             r.raise_for_status()
         except Exception as e:
             print(f"[USPTO] Error '{term}': {e}")
@@ -232,13 +290,14 @@ def scrape_uspto(terms: list[str] = None, max_results: int = MAX_RESULTS) -> lis
         except Exception:
             patents = []
         for p in patents:
-            title = p.get("patent_title","")
-            abstract = p.get("patent_abstract","") or ""
+            title = p.get("patent_title", "") or ""
+            abstract = p.get("patent_abstract", "") or ""
             invs = p.get("inventors") or []
             authors = ", ".join(
-                f"{i.get('inventor_first_name','')} {i.get('inventor_last_name','')}".strip()
-                for i in invs[:5])
-            url = f"https://patents.google.com/patent/US{p.get('patent_number','')}"
+                f"{i.get('inventor_name_first','')} {i.get('inventor_name_last','')}".strip()
+                for i in invs[:5]).strip(", ")
+            pid = p.get("patent_id", "")
+            url = f"https://patents.google.com/patent/US{pid}"
             tech = classify_technology(f"{title} {abstract}")
             meta = extract_metrics(f"{title} {abstract}")
             claims.append({
@@ -246,18 +305,18 @@ def scrape_uspto(terms: list[str] = None, max_results: int = MAX_RESULTS) -> lis
                 "source_url": url,
                 "title": title,
                 "authors": authors,
-                "date_pub": p.get("patent_date","")[:10],
+                "date_pub": (p.get("patent_date", "") or "")[:10],
                 "technology": tech,
                 **meta,
                 "claim_text": abstract[:500],
-                "raw": {"patent_number": p.get("patent_number","")},
+                "raw": {"patent_id": pid},
             })
         time.sleep(SCRAPE_DELAY)
     print(f"[USPTO] {len(claims)} patents")
     return claims
 
 def scrape_climate_pr(feeds: list[str] = None) -> list[dict]:
-    """RSS feeds de Climate Tech → press releases."""
+    """RSS feeds de Climate Tech -> press releases."""
     feeds = feeds or CLIMATE_FEEDS
     claims = []
     for feed_url in feeds:
@@ -285,7 +344,7 @@ def scrape_climate_pr(feeds: list[str] = None) -> list[dict]:
                 date_pub = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             tech = classify_technology(f"{title} {desc}")
             if tech == "other":
-                continue  # filtrar ruido
+                continue
             meta = extract_metrics(f"{title} {desc}")
             claims.append({
                 "source_type": "press_release",
@@ -305,15 +364,21 @@ def scrape_climate_pr(feeds: list[str] = None) -> list[dict]:
 # ──────────────────── INGEST PIPELINE ────────────────────────────
 
 def run_ingest():
-    """Ejecuta todos los scrapers y hace upsert en la DB."""
+    """Ejecuta todos los scrapers, evalua cada claim y hace upsert en la DB."""
     init_db()
     new = 0
+    flagged = 0
     with db_conn() as conn:
         for scraper in [scrape_arxiv, scrape_uspto, scrape_climate_pr]:
             for claim in scraper():
+                annotate_claim(claim)
+                if claim.get("status", "claimed") != "claimed":
+                    flagged += 1
                 if upsert_claim(conn, claim):
                     new += 1
-    print(f"\n✓ Ingesta completa: {new} claims nuevos")
+    print()
+    print(f"OK Ingesta completa: {new} claims nuevos "
+          f"({flagged} marcados por el motor de contradiccion)")
     return new
 
 # ──────────────────── REST API ───────────────────────────────────
@@ -324,14 +389,14 @@ def create_app():
 
     app = FastAPI(title="Energy Intelligence Node",
                   version="1.0.0",
-                  description="API para consultar claims de energías renovables")
+                  description="API para consultar claims de energias renovables")
 
-    # ── Pydantic models ──
     class ClaimOut(PydModel):
         id: str; source_type: str; source_url: str; title: str
         authors: str = ""; date_pub: str; technology: str
         metric_name: str = ""; metric_value: Optional[float]=None
         metric_unit: str = ""; claim_text: str; status: str
+        flag_reason: str = ""; flag_law: str = ""
         created_at: str; updated_at: str
 
     class ClaimIn(PydModel):
@@ -341,29 +406,37 @@ def create_app():
         claim_text: str; status: str = "claimed"
 
     class StatusPatch(PydModel):
-        status: str  # claimed | disputed | debunked
+        status: str
 
     class StatsOut(PydModel):
         total_claims: int; by_source: dict; by_status: dict
         by_technology: dict
 
-    # ── Helpers ──
     def row_to_dict(row):
         d = dict(row)
         d["metric_value"] = float(d["metric_value"]) if d["metric_value"] else None
+        d["flag_reason"] = d.get("flag_reason") or ""
+        d["flag_law"] = d.get("flag_law") or ""
         return d
 
-    # ── Endpoints ──
+    def row_to_claim(row):
+        """Como row_to_dict pero con checked_metrics parseado a lista (para scoring)."""
+        d = row_to_dict(row)
+        try:
+            d["checked_metrics"] = json.loads(d.get("checked_metrics") or "[]")
+        except Exception:
+            d["checked_metrics"] = []
+        return d
+
     @app.get("/claims", response_model=list[ClaimOut])
     def list_claims(
-        technology: Optional[str] = Query(None, description="Filtrar por tecnología"),
-        status: Optional[str] = Query(None, description="claimed|disputed|debunked"),
-        source_type: Optional[str] = Query(None, description="paper|patent|press_release"),
-        metric_name: Optional[str] = Query(None, description="ej: energy_density"),
+        technology: Optional[str] = Query(None),
+        status: Optional[str] = Query(None),
+        source_type: Optional[str] = Query(None),
+        metric_name: Optional[str] = Query(None),
         limit: int = Query(50, ge=1, le=200),
         offset: int = Query(0, ge=0),
     ):
-        """Consultar claims con filtros opcionales."""
         conds, params = [], []
         if technology:  conds.append("technology=?");  params.append(technology)
         if status:      conds.append("status=?");      params.append(status)
@@ -391,17 +464,9 @@ def create_app():
             cid = claim_id(claim["source_url"], claim["title"], claim["date_pub"])
             if conn.execute("SELECT 1 FROM claims WHERE id=?", (cid,)).fetchone():
                 raise HTTPException(409, "Claim ya existe")
-            now = datetime.now(timezone.utc).isoformat()
-            conn.execute("""
-                INSERT INTO claims (id,source_type,source_url,title,authors,date_pub,
-                    technology,metric_name,metric_value,metric_unit,claim_text,
-                    status,raw_json,created_at,updated_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-            """, (cid, claim["source_type"], claim["source_url"], claim["title"],
-                  claim.get("authors",""), claim["date_pub"], claim["technology"],
-                  claim.get("metric_name",""), claim.get("metric_value"),
-                  claim.get("metric_unit",""), claim["claim_text"],
-                  claim.get("status","claimed"), "{}", now, now))
+            annotate_claim(claim)
+            if not upsert_claim(conn, claim):
+                raise HTTPException(409, "Claim ya existe")
             row = conn.execute("SELECT * FROM claims WHERE id=?", (cid,)).fetchone()
         return row_to_dict(row)
 
@@ -434,7 +499,6 @@ def create_app():
 
     @app.post("/scrape")
     def trigger_scrape():
-        """Dispara ingesta asíncrona (en prod usar Celery/background task)."""
         new = run_ingest()
         return {"new_claims": new, "status": "ok"}
 
@@ -445,6 +509,75 @@ def create_app():
                 "SELECT technology, COUNT(*) c FROM claims GROUP BY technology "
                 "ORDER BY c DESC").fetchall()
         return [{"technology": r["technology"], "count": r["c"]} for r in rows]
+
+    @app.get("/contradictions", response_model=list[ClaimOut])
+    def list_contradictions(
+        severity: Optional[str] = Query(None),
+        limit: int = Query(50, ge=1, le=200),
+        offset: int = Query(0, ge=0),
+    ):
+        if severity in ("debunked", "disputed"):
+            where, params = "WHERE status=?", [severity]
+        else:
+            where, params = "WHERE status IN ('debunked','disputed')", []
+        with db_conn() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM claims {where} ORDER BY date_pub DESC LIMIT ? OFFSET ?",
+                params + [limit, offset]).fetchall()
+        return [row_to_dict(r) for r in rows]
+
+    @app.post("/recheck")
+    def recheck_all():
+        changed = 0
+        with db_conn() as conn:
+            rows = conn.execute(
+                "SELECT id,title,claim_text,technology FROM claims "
+                "WHERE status='claimed'").fetchall()
+            now = datetime.now(timezone.utc).isoformat()
+            for r in rows:
+                text = f"{r['title']} {r['claim_text']}"
+                metrics = extract_all_metrics(text)
+                verdict = evaluate_claim(r["technology"], metrics)
+                if verdict["status"] != "claimed":
+                    conn.execute(
+                        "UPDATE claims SET status=?, flag_reason=?, flag_law=?, "
+                        "checked_metrics=?, updated_at=? WHERE id=?",
+                        (verdict["status"], verdict["flag_reason"], verdict["flag_law"],
+                         json.dumps(metrics), now, r["id"]))
+                    changed += 1
+        return {"rechecked": len(rows), "newly_flagged": changed, "status": "ok"}
+
+    @app.get("/claims/{claim_id}/score")
+    def claim_credibility(claim_id: str):
+        """Score de credibilidad (0-100) de una afirmacion, con sus factores."""
+        with db_conn() as conn:
+            row = conn.execute("SELECT * FROM claims WHERE id=?", (claim_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "Claim no encontrado")
+        return score_claim(row_to_claim(row))
+
+    @app.get("/report")
+    def due_diligence_report(
+        technology: Optional[str] = Query(None, description="Filtrar por tecnologia"),
+        source_type: Optional[str] = Query(None, description="paper|patent|press_release"),
+        limit: int = Query(200, ge=1, le=500),
+    ):
+        """Informe de due-diligence: credibilidad agregada + reporte en Markdown."""
+        conds, params = [], []
+        if technology:  conds.append("technology=?");  params.append(technology)
+        if source_type: conds.append("source_type=?"); params.append(source_type)
+        where = ("WHERE " + " AND ".join(conds)) if conds else ""
+        with db_conn() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM claims {where} ORDER BY date_pub DESC LIMIT ?",
+                params + [limit]).fetchall()
+        claims = [row_to_claim(r) for r in rows]
+        title = technology or "Todas las tecnologias"
+        return {
+            "title": title,
+            "aggregate": score_group(claims),
+            "markdown": generate_report(title, claims),
+        }
 
     return app
 
@@ -467,7 +600,8 @@ if __name__ == "__main__":
     else:
         import uvicorn
         app = create_app()
-        print(f"\n⚡ Energy Intelligence Node → http://{args.host}:{args.port}")
+        print()
+        print(f"Energy Intelligence Node -> http://{args.host}:{args.port}")
         print(f"   Docs: http://{args.host}:{args.port}/docs")
-        print(f"   DB:   {DB_PATH}\n")
+        print(f"   DB:   {DB_PATH}")
         uvicorn.run(app, host=args.host, port=args.port)
