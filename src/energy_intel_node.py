@@ -135,15 +135,17 @@ def upsert_claim(conn, claim: dict) -> bool:
 # ──────────────────── EXTRACTION HELPERS ─────────────────────────
 
 TECH_KEYWORDS = {
-    "solid-state-battery":  r"solid.?state.?batter|ssb|sulfide.?electrolyte",
-    "perovskite-solar":     r"perovskite.?solar|psk.?pv|perovskite.?photovol",
-    "sodium-ion":           r"sodium.?ion.?batter|na.?ion",
-    "green-hydrogen":       r"green.?hydrogen|electrolysis|pem.?electroly",
-    "flow-battery":         r"flow.?batter|redox.?flow|vanadium.?flow",
-    "thermophotovoltaic":   r"thermophotovoltaic|tpv|thermo.?pv",
-    "fusion":               r"fusion.?energy|inertial.?confinement|magnetic.?fusion",
-    "agrivoltaics":         r"agrivoltaic|dual.?use.?solar|crop.?solar",
-    "wind":                 r"wind.?turbine|wind.?energy|wind.?power|offshore.?wind|onshore.?wind",
+    "solid-state-battery":  r"solid[ -]?state[ -]?batter|\bssb\b|sulfide[ -]?electrolyte",
+    "perovskite-solar":     r"perovskite[ -]?solar|perovskite[ -]?photovolta",
+    "sodium-ion":           r"sodium[ -]?ion|\bna[ -]?ion\b",
+    "green-hydrogen":       r"green[ -]?hydrogen|water[ -]?electrolysis|pem[ -]?electroly|\belectrolyz",
+    "flow-battery":         r"flow[ -]?batter|redox[ -]?flow|vanadium[ -]?flow",
+    "thermophotovoltaic":   r"thermophotovoltaic|\btpv\b|thermo[ -]?photovolta",
+    "fusion":               r"fusion[ -]?energy|inertial[ -]?confinement|magnetic[ -]?fusion|tokamak",
+    "agrivoltaics":         r"agrivoltaic|dual[ -]?use[ -]?solar|crop[ -]?solar",
+    "wind":                 r"wind[ -]?turbine|wind[ -]?energy|wind[ -]?power|offshore[ -]?wind|onshore[ -]?wind",
+    "silicon-solar":        r"silicon[ -]?solar|crystalline[ -]?silicon|\bc-si\b",
+    "lithium-ion":          r"lithium[ -]?ion|\bli[ -]?ion\b",
 }
 
 METRIC_PATTERNS = [
