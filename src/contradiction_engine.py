@@ -77,7 +77,7 @@ PHYSICAL_LIMITS: list[PhysicalLimit] = [
             "eficiencia bajo luz solar no concentrada. Si la tecnología es "
             "tándem o multiunión, debe declararse explícitamente."
         ),
-        applies_to=frozenset({"perovskite-solar"}),
+        applies_to=frozenset({"perovskite-solar", "silicon-solar"}),
     ),
     # ── ENERGÍA EÓLICA ──
     # Límite de Betz: una turbina no puede extraer más del 59.3% (16/27) de

@@ -61,3 +61,9 @@ def test_hard_violation_takes_priority_over_soft():
 
 def test_none_value_is_ignored():
     assert check_metric("perovskite-solar", "efficiency", None, "%") == []
+
+def test_silicon_single_junction_also_bound_by_shockley_queisser():
+    v = evaluate_claim("silicon-solar", [{"metric_name": "efficiency",
+                                          "metric_value": 36.0, "metric_unit": "%"}])
+    assert v["status"] == "debunked"
+    assert "Shockley" in v["flag_law"]

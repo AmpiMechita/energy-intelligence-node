@@ -140,3 +140,18 @@ def test_extract_cost_dollar_prefix():
 def test_arxiv_queries_are_focused():
     assert any("perovskite" in q for q in ein.ARXIV_QUERIES)
     assert any("battery" in q for q in ein.ARXIV_QUERIES)
+
+def test_classify_no_false_positive_nation():
+    assert ein.classify_technology("the national grid policy reform") == "other"
+    assert ein.classify_technology("a combination of several materials") == "other"
+
+def test_classify_sodium_ion_still_works():
+    assert ein.classify_technology("a new sodium-ion battery cathode") == "sodium-ion"
+    assert ein.classify_technology("Na-ion cell with improved cycling") == "sodium-ion"
+
+def test_classify_silicon_solar():
+    assert ein.classify_technology("crystalline silicon solar module") == "silicon-solar"
+
+def test_classify_lithium_ion():
+    assert ein.classify_technology("a lithium-ion battery anode") == "lithium-ion"
+    assert ein.classify_technology("lion populations in Africa") == "other"
